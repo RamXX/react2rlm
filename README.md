@@ -1,0 +1,431 @@
+# RLM vs ReAct for Compositional Tool Calling
+
+## Thesis
+
+DSPy's RLM (Recursive Language Model) module is often introduced via a
+"sandboxed REPL" pattern, where the LLM writes and runs Python to explore an
+input iteratively. But RLM's deeper value lies elsewhere: **programmatic
+orchestration of tool calls**.
+
+The standard agentic pattern, ReAct (Reasoning + Acting), interleaves one thought
+with one tool call per step:
+
+```
+think -> pick tool -> call tool -> observe -> think -> pick tool -> ...
+```
+
+This works well for exploratory tasks with a few diverse tools. But when a task
+requires **compositional tool use** -- calling the same tool many times with
+different arguments, cross-referencing results, and aggregating outputs -- ReAct
+degrades in predictable ways:
+
+- **Incomplete coverage**: the LLM uses domain heuristics to pick "important"
+  pairs rather than enumerating all of them
+- **Superlinear token cost**: each step often re-reads a growing trajectory, so
+  total tokens can approach O(N^2) as the number of tool calls grows
+- **No programmatic aggregation**: classification, filtering, and counting must
+  happen in natural language reasoning, which is lossy
+
+RLM sidesteps all of this by writing code:
+
+```python
+for a, b in combinations(drugs, 2):
+    result = check_drug_interaction(a, b)
+    if "INTERACTION" in result:
+        interactions.append(result)
+```
+
+Once the code is written and executed, the enumeration is complete by
+construction (e.g. all `N choose 2` pairs).
+
+## Experiment
+
+### Scenario: Drug Interaction Checker
+
+A patient takes 7 medications and has 2 medical conditions. A safety check
+requires:
+
+- **21 pairwise drug interaction checks** (7 choose 2)
+- **14 drug-condition contraindication checks** (7 drugs x 2 conditions)
+- Aggregation by severity level (major/moderate/minor)
+- A structured risk assessment
+
+Three approaches are compared using DSPy v3.1.3 with `groq/openai/gpt-oss-120b`.
+
+Note on reproducibility: this repo includes a captured run log in `output.txt`.
+The exact wall times and even the exact tool-call behavior can vary across
+runs/providers/model versions (LLMs are not deterministic), but the numbers in
+the Results section below are taken directly from that captured run.
+
+| Approach | Architecture | Description |
+|---|---|---|
+| **ReAct** | `dspy.ReAct` | Standard reasoning-action loop |
+| **RLM Direct** | `dspy.RLM` with tools | LLM writes Python in a sandboxed REPL to orchestrate tool calls |
+| **RLM + ReAct Hybrid** | `dspy.RLM` planner, `dspy.ReAct` executor | RLM generates a structured plan, ReAct executes it |
+
+### Tools
+
+All three approaches share identical tools backed by simulated databases:
+
+- `check_drug_interaction(drug_a, drug_b)` -- returns severity and clinical
+  details for a drug pair
+- `check_contraindication(drug, condition)` -- checks whether a drug is
+  contraindicated for a medical condition
+- `get_drug_class(drug)` -- returns pharmacological classification
+
+### Medications and Conditions
+
+```
+Medications: warfarin, amiodarone, simvastatin, aspirin, lisinopril, metformin, potassium
+Conditions:  chronic_kidney_disease, heart_failure
+```
+
+The interaction database contains 8 known interactions (4 major, 2 moderate,
+2 minor) and 2 contraindications (metformin and potassium in CKD).
+
+## Results
+
+### Summary Table
+
+The table below is the **single captured run** in `output.txt` (recorded on
+2026-02-09).
+
+| Metric | ReAct | RLM Direct | RLM + ReAct |
+|---|---|---|---|
+| Wall time | 0.1s | 8.5s | 52.9s |
+| Tool calls | 6 | 35 | 35 |
+| Drug pairs checked | 4 / 21 (19%) | **21 / 21 (100%)** | **21 / 21 (100%)** |
+| Contraindications checked | 2 / 14 (14%) | **14 / 14 (100%)** | **14 / 14 (100%)** |
+| Interactions found | 4 / 8 | **8 / 8** | **8 / 8** |
+| Contraindications found | 2 / 2 | **2 / 2** | **2 / 2** |
+| LLM reasoning steps | 7 | 5 iterations | 36 steps (1 plan + 35 exec) |
+| Output format | Prose narrative | Structured dict | Prose narrative |
+
+### Approach 1: ReAct
+
+In this run, ReAct made 6 tool calls across 7 reasoning steps and finished in
+0.1s. It checked 2 drug-condition pairs (both contraindications present in the
+simulated DB) and 4 drug-drug pairs, finding 4 major interactions (as labeled
+by the simulated DB). The output was a strong narrative with monitoring plans
+and action items.
+
+However, it **missed 17 of 21 drug pairs**. The LLM used domain knowledge to
+triage combinations rather than systematically checking all of them. This missed
+interactions that exist in the simulated database:
+
+- `warfarin + simvastatin` (moderate -- INR monitoring needed)
+- `aspirin + lisinopril` (moderate -- reduced BP control)
+- `aspirin + metformin` (minor -- safe to combine)
+- `lisinopril + metformin` (minor -- improved insulin sensitivity)
+
+For a safety-critical application, 19% coverage is unacceptable regardless of
+how good the clinical reasoning is on the pairs that were checked.
+
+### Approach 2: RLM Direct
+
+In this run, RLM completed all 35 tool calls and produced a structured risk
+assessment in 8.5s across 5 REPL iterations:
+
+| Iteration | What happened |
+|---|---|
+| 0 | Syntax error (trailing markdown fence in generated code), self-corrected |
+| 1 | Parsed comma-separated inputs into Python lists, verified 7 meds + 2 conditions |
+| 2 | Wrote nested `for` loops to call all 21 drug pairs and 14 contraindication checks in a single code block; collected results into a dict |
+| 3 | Wrote filter functions to separate real findings from "no known interaction" results; reduced 21 interactions to 8, 14 contraindications to 2 |
+| 4 | Called `SUBMIT(risk_assessment)` with the cleaned structured dict |
+
+All 35 tool calls executed within a single iteration (iteration 2). The RLM
+wrote exactly the code pattern the thesis predicted:
+
+```python
+for i in range(len(med_list)):
+    for j in range(i + 1, len(med_list)):
+        result = check_drug_interaction(med_list[i], med_list[j])
+        interactions.append({"drug_a": ..., "drug_b": ..., "details": result})
+```
+
+The output was a structured Python dict containing all *findings* (the 8 known
+interactions and 2 known contraindications) filtered from the exhaustive checks.
+**100% pairwise coverage in this run (21/21 checked).**
+
+### Approach 3: RLM Planner + ReAct Executor
+
+The hybrid approach used RLM to generate a structured plan (which pairs to
+check, in what order), then handed that plan plus the raw medication/condition
+data to a ReAct agent for execution.
+
+ReAct executed the plan faithfully, making all 35 tool calls across 36 reasoning
+steps. The output was the most polished clinical narrative of all three
+approaches, with a detailed risk table, management plan, and monitoring schedule.
+
+However, it took 52.9s -- because ReAct still processes one tool call per
+reasoning step, re-reading the growing trajectory each time. The RLM planner
+ensured completeness, but ReAct's execution overhead dominated.
+
+## Analysis
+
+### Why RLM Wins on Compositional Tool Use
+
+| Dimension | ReAct | RLM |
+|---|---|---|
+| **Enumeration** | Heuristic; may forget pairs | `for a, b in combinations(drugs, 2)` -- provably complete |
+| **Aggregation** | Reasons over a growing wall of text | `major = [i for i in results if "major" in i]` |
+| **Branching** | Implicit in natural language | `if severity == "major": deeper_check(a, b)` |
+| **Token cost** | O(N^2) -- trajectory re-read each step | Often closer to O(N) for the *tool enumeration* portion, because tool calls can happen inside code and the LLM mainly sees summarized/printed output |
+| **Parallelism** | One tool call per step | `results = [check(a,b) for a,b in pairs]` in one execution |
+| **Error recovery** | Must reason about failure and retry | `try/except` with explicit fallback |
+| **State** | Natural language paraphrasing (lossy) | `results_dict[key] = value` (lossless) |
+
+### When to Use Which
+
+**Use ReAct when:**
+
+- Few tool calls are needed (< 5)
+- Tools are diverse (search, calculate, fetch -- a different tool each step)
+- The reasoning path is genuinely uncertain and exploratory
+- You need the agent to "think out loud" for interpretability
+- Latency matters and the task is simple
+
+**Use RLM when:**
+
+- Many similar tool calls are needed (systematic exploration)
+- Results need cross-referencing, filtering, or aggregation
+- The tool-calling pattern is compositional (loops, conditionals)
+- Token efficiency matters (large number of tool interactions)
+- You need programmatic error handling
+- Completeness is more important than speed
+
+**Use RLM + ReAct hybrid when:**
+
+- Planning is combinatorial but execution benefits from adaptive reasoning
+- You want to optimize the executor with GEPA/MIPROv2 while keeping RLM fixed
+- You need both systematic coverage and polished natural-language output
+
+## Practical Applications
+
+The RLM pattern applies to any domain where a task decomposes into many
+structurally similar tool calls that must be exhaustively executed, then
+aggregated. The signature is:
+
+1. **Input is a list or set of entities** (drugs, servers, securities, accounts)
+2. **The check is pairwise or cross-product** (N choose 2, or N x M)
+3. **Results must be filtered, classified, or aggregated**
+4. **Completeness matters** (missing one pair could be catastrophic)
+
+### Compliance and Audit
+
+```python
+rlm = dspy.RLM(
+    "policies: str, systems: str -> compliance_report: str",
+    tools=[check_policy_compliance, get_system_config, check_data_residency],
+    max_iterations=20,
+)
+```
+
+Check every system against every regulatory policy. For 50 systems and 20
+policies, that is 1000 checks. ReAct may not enumerate all of them without
+being explicitly forced to. RLM writes
+`for system in systems: for policy in policies: check(system, policy)`.
+
+### Security Vulnerability Scanning
+
+```python
+rlm = dspy.RLM(
+    "endpoints: str, attack_vectors: str -> vulnerability_report: str",
+    tools=[test_endpoint, check_cve_database, verify_tls_config],
+    max_iterations=20,
+)
+```
+
+Test every API endpoint against every known attack vector. Aggregate results by
+severity. Flag endpoints with multiple vulnerabilities. The same loop-and-filter
+pattern applies.
+
+### Financial Portfolio Risk Analysis
+
+```python
+rlm = dspy.RLM(
+    "holdings: str, risk_factors: str -> risk_report: str",
+    tools=[get_correlation, check_exposure, calculate_var],
+    max_iterations=20,
+)
+```
+
+For N holdings, compute the N*(N-1)/2 pairwise correlations, check each holding
+against each risk factor, calculate portfolio-level VaR. ReAct might check the
+top 5 correlations; RLM checks all of them.
+
+### Supply Chain Dependency Audit
+
+```python
+rlm = dspy.RLM(
+    "components: str, suppliers: str -> supply_chain_risk: str",
+    tools=[check_supplier_status, find_alternatives, assess_lead_time],
+    max_iterations=20,
+)
+```
+
+For every component, check every supplier for sanctions compliance, financial
+health, and lead time. Cross-reference single-source dependencies. The
+combinatorial structure is identical.
+
+### Test Matrix Execution
+
+```python
+rlm = dspy.RLM(
+    "features: str, environments: str -> test_report: str",
+    tools=[run_test, check_compatibility, get_test_history],
+    max_iterations=20,
+)
+```
+
+Run every feature test against every environment (OS x browser x version).
+Aggregate pass/fail rates. Identify environment-specific regressions. RLM
+writes the nested loop; ReAct would check a handful and declare victory.
+
+### The General Pattern
+
+Any time you find yourself thinking "I need to check every X against every Y and
+then summarize the results," you want RLM over ReAct. The more Xs and Ys there
+are, the greater the advantage.
+
+```python
+# The RLM pattern for exhaustive cross-referencing
+rlm = dspy.RLM(
+    "items_a: str, items_b: str -> report: str",
+    tools=[check_pair, get_details],
+    max_iterations=20,
+    max_llm_calls=50,
+)
+```
+
+The LLM will write something like:
+
+```python
+a_list = [x.strip() for x in items_a.split(",")]
+b_list = [x.strip() for x in items_b.split(",")]
+
+results = []
+for a in a_list:
+    for b in b_list:
+        result = check_pair(a, b)
+        if is_significant(result):
+            results.append({"a": a, "b": b, "details": result})
+
+summary = llm_query(f"Summarize these {len(results)} findings: {results}")
+SUBMIT(report=summary)
+```
+
+A few iterations. Complete coverage (when you loop exhaustively). Structured
+output. No missed pairs within the enumerated space.
+
+## Setup
+
+### Requirements
+
+- Python 3.13+ (matches `.python-version` and `pyproject.toml`)
+- [Deno](https://deno.land) (for RLM's sandboxed execution)
+- A [Groq](https://groq.com) API key (`GROQ_API_KEY`) for the default model
+  configured in the script
+
+### Installation
+
+```bash
+# Clone and set up (this repo already includes pyproject.toml + uv.lock)
+cd /path/to/project
+uv venv -p 3.13
+source .venv/bin/activate
+uv sync --frozen
+
+# Install Deno (required for RLM)
+curl -fsSL https://deno.land/install.sh | sh
+
+# IMPORTANT: Restart your shell after installing Deno, or run:
+export PATH="$HOME/.deno/bin:$PATH"
+```
+
+Note: `rlm_vs_react_tool_calling.py` will also try to find Deno at
+`~/.deno/bin/deno` if it is not on your `PATH`, but exporting `PATH` is still
+the simplest/most reliable setup.
+
+### Configuration
+
+Create a `.env` file:
+
+```
+GROQ_API_KEY=your-key-here
+```
+
+### Known Deno Issue
+
+Observed issue (macOS): if a `package.json`, `deno.json`, or `deno.lock` exists
+in a parent directory of the project, Deno may attempt local `node_modules`
+resolution instead of using its global cache. This can break RLM's sandbox
+permissions because DSPy only whitelists `~/.deno/bin` and the Deno cache
+directory (`~/Library/Caches/deno` on macOS) for `--allow-read`.
+
+**Symptom:** `Response ID mismatch during health check: expected 1, got None`
+
+**Fix:** Remove stray `package.json` / `deno.lock` / `node_modules` from
+directories above your project. These files cause Deno to resolve `npm:pyodide`
+from a local `node_modules` that the sandbox cannot read.
+
+### Running
+
+```bash
+source .venv/bin/activate
+uv run --env-file .env -p 3.13 -- python rlm_vs_react_tool_calling.py
+```
+
+If you want to reproduce the captured run format, you can tee to a file:
+
+```bash
+uv run --env-file .env -p 3.13 -- python rlm_vs_react_tool_calling.py | tee output.txt
+```
+
+## Optional: GEPA Optimization (Training)
+
+This repo also includes an optional GEPA training script, `gepa_train_rlm.py`,
+that compiles an optimized version of the RLM agent. This is useful if you want
+to demonstrate DSPy's differentiator: optimizing the *tool-orchestration
+behavior* (what code the RLM writes, how it filters, how it formats outputs).
+
+Important notes:
+- GEPA uses additional LLM calls and will incur cost.
+- The default metric is a deterministic tool-call "coverage" check (did the
+  agent actually enumerate all `N choose 2` interaction calls and all `N x M`
+  contraindication calls). This is cheap and directly tests the thesis. You can
+  also choose an LLM-based metric (`semantic_f1`), which is more expensive.
+- `gepa_train_rlm.py` lets you choose a separate **reflection model** (used by
+  GEPA to propose instruction mutations) that can be stronger than the
+  **program model** you're optimizing.
+
+Dry-run (no LLM calls):
+
+```bash
+uv run --env-file .env -p 3.13 -- python gepa_train_rlm.py --dry-run
+```
+
+Small-budget smoke run (will incur some cost):
+
+```bash
+uv run --env-file .env -p 3.13 -- python gepa_train_rlm.py --max-metric-calls 6 --metric coverage
+```
+
+Program/reflection example:
+
+```bash
+uv run --env-file .env -p 3.13 -- python gepa_train_rlm.py --program-model groq/openai/gpt-oss-20b --reflection-model groq/openai/gpt-oss-120b --max-metric-calls 6 --metric coverage
+```
+
+## Disclaimer
+
+This project uses a **simulated** drug interaction/contraindication database to
+demonstrate tool-calling patterns. It is **not medical advice** and should not
+be used for clinical decisions.
+
+## References
+
+- [DSPy documentation](https://dspy.ai)
+- [DSPy RLM module](https://dspy.ai/api/modules/RLM/)
+- [ReAct: Synergizing Reasoning and Acting in Language Models](https://arxiv.org/abs/2210.03629) (Yao et al., 2022)

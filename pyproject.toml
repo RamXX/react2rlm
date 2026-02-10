@@ -1,0 +1,9 @@
+[project]
+name = "react2rlm"
+version = "0.1.0"
+description = "RLM vs ReAct for compositional tool calling in DSPy"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "dspy>=3.1.3",
+]
