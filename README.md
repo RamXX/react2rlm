@@ -52,10 +52,10 @@ requires:
 
 Three approaches are compared using DSPy v3.1.3 with `groq/openai/gpt-oss-120b`.
 
-Note on reproducibility: this repo includes a captured run log in `output.txt`.
-The exact wall times and even the exact tool-call behavior can vary across
-runs/providers/model versions (LLMs are not deterministic), but the numbers in
-the Results section below are taken directly from that captured run.
+The exact tool-call behavior can vary across runs/providers/model versions
+(LLMs are not deterministic). For latency claims, use this timing protocol:
+initialize `dspy.LM(..., cache=False)`, run each approach 3 times, and report
+the mean wall time.
 
 | Approach | Architecture | Description |
 |---|---|---|
@@ -85,92 +85,25 @@ The interaction database contains 8 known interactions (4 major, 2 moderate,
 
 ## Results
 
-### Summary Table
-
-The table below is the **single captured run** in `output.txt` (recorded on
-2026-02-09).
+Model and runtime configuration used:
+- DSPy v3.1.3
+- `groq/openai/gpt-oss-120b`
+- `dspy.LM(..., cache=False)` (no cache)
+- dependencies refreshed with `uv sync -U`
+- 3 runs per approach (`--runs 3`)
+- wall time reported as mean +/- standard deviation
 
 | Metric | ReAct | RLM Direct | RLM + ReAct |
 |---|---|---|---|
-| Wall time | 0.1s | 8.5s | 52.9s |
-| Tool calls | 6 | 35 | 35 |
-| Drug pairs checked | 4 / 21 (19%) | **21 / 21 (100%)** | **21 / 21 (100%)** |
-| Contraindications checked | 2 / 14 (14%) | **14 / 14 (100%)** | **14 / 14 (100%)** |
-| Interactions found | 4 / 8 | **8 / 8** | **8 / 8** |
-| Contraindications found | 2 / 2 | **2 / 2** | **2 / 2** |
-| LLM reasoning steps | 7 | 5 iterations | 36 steps (1 plan + 35 exec) |
-| Output format | Prose narrative | Structured dict | Prose narrative |
+| Wall time (mean +/- sd) | 13.1s +/- 1.1s | **8.3s +/- 2.7s** | 65.4s +/- 1.4s |
+| Successful runs | 3 / 3 | 3 / 3 | 2 / 3 |
+| Pairwise coverage signal | 4-5 / 21 | **21 / 21 in all 3 runs** | Unstable (one 21 / 21 run, one 4 / 21 run, one failure) |
+| Notable failure | none | none | `AttributeError: 'NoneType' object has no attribute 'strip'` (1 run) |
 
-### Approach 1: ReAct
-
-In this run, ReAct made 6 tool calls across 7 reasoning steps and finished in
-0.1s. It checked 2 drug-condition pairs (both contraindications present in the
-simulated DB) and 4 drug-drug pairs, finding 4 major interactions (as labeled
-by the simulated DB). The output was a strong narrative with monitoring plans
-and action items.
-
-However, it **missed 17 of 21 drug pairs**. The LLM used domain knowledge to
-triage combinations rather than systematically checking all of them. This missed
-interactions that exist in the simulated database:
-
-- `warfarin + simvastatin` (moderate -- INR monitoring needed)
-- `aspirin + lisinopril` (moderate -- reduced BP control)
-- `aspirin + metformin` (minor -- safe to combine)
-- `lisinopril + metformin` (minor -- improved insulin sensitivity)
-
-For a safety-critical application, 19% coverage is unacceptable regardless of
-how good the clinical reasoning is on the pairs that were checked.
-
-### Approach 2: RLM Direct
-
-In this run, RLM completed all 35 tool calls and produced a structured risk
-assessment in 8.5s across 5 REPL iterations:
-
-| Iteration | What happened |
-|---|---|
-| 0 | Syntax error (trailing markdown fence in generated code), self-corrected |
-| 1 | Parsed comma-separated inputs into Python lists, verified 7 meds + 2 conditions |
-| 2 | Wrote nested `for` loops to call all 21 drug pairs and 14 contraindication checks in a single code block; collected results into a dict |
-| 3 | Wrote filter functions to separate real findings from "no known interaction" results; reduced 21 interactions to 8, 14 contraindications to 2 |
-| 4 | Called `SUBMIT(risk_assessment)` with the cleaned structured dict |
-
-All 35 tool calls executed within a single iteration (iteration 2). The RLM
-wrote exactly the code pattern the thesis predicted:
-
-```python
-for i in range(len(med_list)):
-    for j in range(i + 1, len(med_list)):
-        result = check_drug_interaction(med_list[i], med_list[j])
-        interactions.append({"drug_a": ..., "drug_b": ..., "details": result})
-```
-
-The output was a structured Python dict containing all *findings* (the 8 known
-interactions and 2 known contraindications) filtered from the exhaustive checks.
-**100% pairwise coverage in this run (21/21 checked).**
-
-### Approach 3: RLM Planner + ReAct Executor (Ablation)
-
-The hybrid approach used RLM to generate a structured plan (which pairs to
-check, in what order), then handed that plan plus the raw medication/condition
-data to a ReAct agent for execution.
-
-ReAct executed the plan faithfully, making all 35 tool calls across 36 reasoning
-steps. The output was the most polished clinical narrative of all three
-approaches, with a detailed risk table, management plan, and monitoring schedule.
-
-However, it took 52.9s -- because ReAct still processes one tool call per
-reasoning step, re-reading the growing trajectory each time. The RLM planner
-ensured completeness, but ReAct's execution overhead dominated.
-
-**Why include this approach?** It serves as a controlled ablation that isolates
-*where* the completeness comes from. With three data points --
-ReAct alone (19% coverage), RLM alone (100%), and RLM plan + ReAct execution
-(100%) -- we can make a causal claim: the coverage gain is entirely attributable
-to RLM's systematic enumeration in the planning phase, not to anything about how
-tools are called at execution time. Swap the executor from code to ReAct,
-coverage stays at 100%. Without this ablation, one could argue that the Python
-sandbox or the code execution itself is doing the work. The hybrid closes
-that door: **the program is doing the work, not the execution strategy.**
+Current takeaway:
+- ReAct produces strong narrative reasoning but does not reliably enumerate all pairs.
+- RLM Direct is fastest in this benchmark and consistently achieves complete pairwise coverage.
+- RLM+ReAct remains useful as an ablation architecture, but is much slower and less stable here.
 
 ## Analysis
 
@@ -185,6 +118,21 @@ that door: **the program is doing the work, not the execution strategy.**
 | **Parallelism** | One tool call per step | `results = [check(a,b) for a,b in pairs]` in one execution |
 | **Error recovery** | Must reason about failure and retry | `try/except` with explicit fallback |
 | **State** | Natural language paraphrasing (lossy) | `results_dict[key] = value` (lossless) |
+
+### Model Sensitivity (Important)
+
+These numbers are model-specific. The benchmark above used
+`groq/openai/gpt-oss-120b`, and outcomes can change significantly with stronger
+or weaker models.
+
+This is consistent with the Recursive Language Models paper: RLM-style
+program synthesis/orchestration depends heavily on the base model's capability.
+Stronger models generally produce more reliable planning, code generation,
+self-correction, and final outputs.
+
+Practical takeaway: treat this repo's metrics as a reference point, not a fixed
+ceiling. If you are evaluating RLM seriously, test multiple stronger models and
+re-run the same uncached multi-run protocol.
 
 ### When to Use Which
 
@@ -207,9 +155,9 @@ that door: **the program is doing the work, not the execution strategy.**
 
 **The RLM + ReAct hybrid** is included as an ablation study (see Approach 3
 above). It demonstrates that completeness is a property of the plan, not the
-executor. In practice, RLM Direct dominates on every operational axis: speed
-(8.5s vs 52.9s), token cost, and structured output. The hybrid's value is
-analytical, not practical.
+executor. In this benchmark, RLM Direct is faster on average (8.3s vs 65.4s)
+and more stable. The
+hybrid's value is primarily analytical, not practical.
 
 ## A Neuro-Symbolic Perspective
 
@@ -217,8 +165,8 @@ RLM, at least as used here, is a neuro-symbolic technique. The LLM (neural)
 synthesizes an executable Python program (symbolic artifact), and a sandboxed
 interpreter (symbolic executor) runs it deterministically. The program provides
 formal guarantees -- completeness of enumeration, structured aggregation -- that
-the neural model alone demonstrably cannot achieve (19% coverage under ReAct vs
-100% under RLM).
+the neural model alone does not reliably achieve (4-5/21 pair coverage for
+ReAct vs 21/21 for RLM Direct in this benchmark).
 
 ### Kautz Taxonomy Classification
 
@@ -241,9 +189,10 @@ The three experimental approaches actually span the taxonomy:
 | RLM + ReAct | **Type 6 / Type 2 hybrid** | Symbolic plan (Type 6 output) structures a neural executor (Type 2 pattern) |
 
 The progression from ReAct to RLM Direct to the hybrid is a gradient from pure
-neural to increasingly neuro-symbolic, and the coverage results (19% -> 100% ->
-100%) track that gradient directly. This is an empirical demonstration of where
-symbolic structure adds value in the Kautz framework.
+neural to increasingly neuro-symbolic. In this benchmark, RLM Direct remains
+consistently complete while the hybrid is unstable. This highlights where
+symbolic structure adds value in the Kautz framework, while also underscoring
+model and executor sensitivity.
 
 ### What Makes This Neuro-Symbolic
 
@@ -445,10 +394,25 @@ source .venv/bin/activate
 uv run --env-file .env -p 3.13 -- python rlm_vs_react_tool_calling.py
 ```
 
-If you want to reproduce the captured run format, you can tee to a file:
+By default, the script now runs each approach 3 times with `cache=False` and
+prints a `WALL-TIME SUMMARY` with mean and standard deviation. You can change
+the repeat count:
 
 ```bash
-uv run --env-file .env -p 3.13 -- python rlm_vs_react_tool_calling.py | tee output.txt
+uv run --env-file .env -p 3.13 -- python rlm_vs_react_tool_calling.py --runs 3
+```
+
+If you want to capture the full run output:
+
+```bash
+uv run --env-file .env -p 3.13 -- python rlm_vs_react_tool_calling.py | tee output_runs3_uncached.txt
+```
+
+To reproduce the benchmark format shown above:
+
+```bash
+uv sync -U
+uv run --env-file .env -p 3.13 -- python rlm_vs_react_tool_calling.py --runs 3 | tee output_runs3_uncached.txt
 ```
 
 ## Optional: GEPA Optimization (Training)

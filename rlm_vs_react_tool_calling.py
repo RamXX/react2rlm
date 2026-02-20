@@ -36,9 +36,11 @@ ReAct will do this one pair at a time, burning 45+ reasoning steps.
 RLM can write a loop and do it in a handful of iterations.
 """
 
+import argparse
 import dspy
 import os
 import shutil
+import statistics
 import textwrap
 import time
 from itertools import combinations
@@ -594,10 +596,11 @@ def print_rlm_trajectory(trajectory):
         print(f"  {str(trajectory)[:500]}")
 
 
-def run_approach(name: str, agent, drugs_list: list[str], **kwargs):
-    """Run an agent, capture timing, tool log, and trajectory."""
+def run_approach(name: str, agent, drugs_list: list[str], verbose: bool = True, **kwargs):
+    """Run an agent once and return metrics used for multi-run summaries."""
     TOOL_LOG.reset()
     t0 = time.monotonic()
+    expected_pairs = len(list(combinations(drugs_list, 2)))
 
     print(f"\n{'=' * 70}")
     print(f"  {name}")
@@ -609,50 +612,136 @@ def run_approach(name: str, agent, drugs_list: list[str], **kwargs):
     except Exception as e:
         elapsed = time.monotonic() - t0
         print(f"\n  FAILED after {elapsed:.1f}s: {type(e).__name__}: {e}")
-        TOOL_LOG.print_summary()
+        if verbose:
+            TOOL_LOG.print_summary()
         missed = TOOL_LOG.missed_pairs(drugs_list)
-        if missed:
+        if verbose and missed:
             print(f"\n  Missed drug pairs ({len(missed)}):")
             for a, b in missed:
                 print(f"    - {a} + {b}")
-        return None
+        return {
+            "ok": False,
+            "elapsed": elapsed,
+            "tool_calls": len(TOOL_LOG.calls),
+            "missed_pairs": len(missed),
+            "expected_pairs": expected_pairs,
+        }
 
-    # -- Result --
-    risk = getattr(result, "risk_assessment", None) or str(result)
-    print(f"\n  RESULT ({elapsed:.1f}s):")
-    for line in textwrap.wrap(str(risk), width=72):
-        print(f"    {line}")
+    if verbose:
+        # -- Result --
+        risk = getattr(result, "risk_assessment", None) or str(result)
+        print(f"\n  RESULT ({elapsed:.1f}s):")
+        for line in textwrap.wrap(str(risk), width=72):
+            print(f"    {line}")
 
-    # -- Trajectory --
-    traj = getattr(result, "trajectory", None)
-    if traj:
-        print(f"\n  TRAJECTORY:")
-        if "thought_0" in (traj if isinstance(traj, dict) else {}):
-            print_react_trajectory(traj)
-        else:
-            print_rlm_trajectory(traj)
+        # -- Trajectory --
+        traj = getattr(result, "trajectory", None)
+        if traj:
+            print(f"\n  TRAJECTORY:")
+            if "thought_0" in (traj if isinstance(traj, dict) else {}):
+                print_react_trajectory(traj)
+            else:
+                print_rlm_trajectory(traj)
 
-    # -- Tool call log --
-    TOOL_LOG.print_summary()
+        # -- Tool call log --
+        TOOL_LOG.print_summary()
 
     # -- Coverage check --
     missed = TOOL_LOG.missed_pairs(drugs_list)
-    if missed:
+    if verbose and missed:
         print(f"\n  WARNING: Missed {len(missed)} drug pairs:")
         for a, b in missed:
             print(f"    - {a} + {b}")
+    elif verbose:
+        print(f"\n  COVERAGE: All {expected_pairs} drug pairs checked.")
     else:
-        print(f"\n  COVERAGE: All {len(list(combinations(drugs_list, 2)))} "
-              f"drug pairs checked.")
+        checked = expected_pairs - len(missed)
+        coverage_pct = 100.0 * checked / expected_pairs
+        print(
+            f"\n  SUMMARY: {elapsed:.1f}s | "
+            f"tool calls={len(TOOL_LOG.calls)} | "
+            f"pair coverage={checked}/{expected_pairs} ({coverage_pct:.0f}%)"
+        )
 
-    return result
+    return {
+        "ok": True,
+        "elapsed": elapsed,
+        "tool_calls": len(TOOL_LOG.calls),
+        "missed_pairs": len(missed),
+        "expected_pairs": expected_pairs,
+    }
+
+
+def run_approach_repeated(
+    name: str,
+    agent_factory,
+    runs: int,
+    drugs_list: list[str],
+    **kwargs,
+):
+    """Run one approach multiple times and print an average timing summary."""
+    stats = []
+    for run_idx in range(1, runs + 1):
+        run_stats = run_approach(
+            f"{name} (run {run_idx}/{runs})" if runs > 1 else name,
+            agent_factory(),
+            drugs_list,
+            verbose=(run_idx == 1),
+            **kwargs,
+        )
+        if run_stats["ok"]:
+            stats.append(run_stats)
+
+    if not stats:
+        print(f"\n  No successful runs for {name}.")
+        return {"name": name, "runs": runs, "successful_runs": 0}
+
+    elapsed_values = [s["elapsed"] for s in stats]
+    mean_elapsed = statistics.mean(elapsed_values)
+    stdev_elapsed = statistics.stdev(elapsed_values) if len(elapsed_values) > 1 else 0.0
+    mean_tool_calls = statistics.mean(s["tool_calls"] for s in stats)
+    mean_missed_pairs = statistics.mean(s["missed_pairs"] for s in stats)
+
+    print(
+        f"\n  {name} AVERAGE over {len(stats)} successful runs: "
+        f"{mean_elapsed:.1f}s +/- {stdev_elapsed:.1f}s | "
+        f"tool calls={mean_tool_calls:.1f} | "
+        f"missed pairs={mean_missed_pairs:.1f}"
+    )
+
+    return {
+        "name": name,
+        "runs": runs,
+        "successful_runs": len(stats),
+        "mean_elapsed": mean_elapsed,
+        "stdev_elapsed": stdev_elapsed,
+        "mean_tool_calls": mean_tool_calls,
+        "mean_missed_pairs": mean_missed_pairs,
+    }
 
 
 def main():
     """Demonstrate the difference between ReAct and RLM for tool calling."""
+    parser = argparse.ArgumentParser(
+        description="Compare ReAct and RLM on compositional tool calling."
+    )
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=3,
+        help="Number of runs per approach for wall-time averaging (default: 3).",
+    )
+    args = parser.parse_args()
+    if args.runs < 1:
+        parser.error("--runs must be >= 1")
 
-    # Configure DSPy
-    lm = dspy.LM("groq/openai/gpt-oss-120b", max_tokens=8000, temperature=0.1)
+    # Configure DSPy; disable LM cache so wall times reflect real inference work.
+    lm = dspy.LM(
+        "groq/openai/gpt-oss-120b",
+        max_tokens=8000,
+        temperature=0.1,
+        cache=False,
+    )
     dspy.configure(lm=lm)
 
     # The test case: 7 drugs, 2 conditions = 21 pairs + 14 contraindication checks
@@ -667,15 +756,16 @@ def main():
     print("  Scenario: Drug interaction check for 7 medications, 2 conditions")
     print(f"  Expected pairwise checks: {len(list(combinations(drugs_list, 2)))}")
     print(f"  Expected contraindication checks: {len(drugs_list) * 2}")
+    print(f"  Timing protocol: cache disabled, {args.runs} runs/approach, report mean")
     print("=" * 70)
 
     # ------------------------------------------------------------------
     # APPROACH 1: Standard ReAct
     # ------------------------------------------------------------------
-    react_agent = build_react_agent()
-    run_approach(
+    react_summary = run_approach_repeated(
         "APPROACH 1: Standard ReAct",
-        react_agent,
+        build_react_agent,
+        args.runs,
         drugs_list,
         medications=medications,
         conditions=conditions,
@@ -684,10 +774,10 @@ def main():
     # ------------------------------------------------------------------
     # APPROACH 2: RLM Direct
     # ------------------------------------------------------------------
-    rlm_agent = build_rlm_agent()
-    run_approach(
+    rlm_summary = run_approach_repeated(
         "APPROACH 2: RLM Direct (programmatic tool orchestration)",
-        rlm_agent,
+        build_rlm_agent,
+        args.runs,
         drugs_list,
         medications=medications,
         conditions=conditions,
@@ -696,14 +786,30 @@ def main():
     # ------------------------------------------------------------------
     # APPROACH 3: Hybrid (RLM planner + ReAct executor)
     # ------------------------------------------------------------------
-    hybrid_agent = RLMPlannerWithReAct()
-    run_approach(
+    hybrid_summary = run_approach_repeated(
         "APPROACH 3: RLM Planner + ReAct Executor",
-        hybrid_agent,
+        RLMPlannerWithReAct,
+        args.runs,
         drugs_list,
         medications=medications,
         conditions=conditions,
     )
+
+    # ------------------------------------------------------------------
+    # Timing summary (easy to copy into README)
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("  WALL-TIME SUMMARY (cache disabled)")
+    print("=" * 70)
+    for summary in [react_summary, rlm_summary, hybrid_summary]:
+        if summary["successful_runs"] == 0:
+            print(f"  {summary['name']}: no successful runs")
+            continue
+        print(
+            f"  {summary['name']}: "
+            f"{summary['mean_elapsed']:.1f}s +/- {summary['stdev_elapsed']:.1f}s "
+            f"over {summary['successful_runs']}/{summary['runs']} runs"
+        )
 
     # ------------------------------------------------------------------
     # Summary comparison

@@ -14,3 +14,6 @@ wheels/
 
 # GEPA artifacts
 gepa_rlm_state.json
+
+# Other
+presentation.html
